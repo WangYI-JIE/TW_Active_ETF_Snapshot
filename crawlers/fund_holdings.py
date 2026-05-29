@@ -24,7 +24,9 @@ import requests
 from bs4 import BeautifulSoup
 
 
-ETFS = [
+# Last-resort fallback universe, used only if the TWSE active list is
+# unreachable. The canonical list is fetched live (see fetch_active_etf_list).
+FALLBACK_ETFS = [
     "00980A", "00981A", "00982A", "00984A", "00985A",
     "00987A", "00991A", "00992A", "00993A", "00994A",
     "00995A", "00996A", "00400A", "00401A", "00999A",
@@ -32,6 +34,7 @@ ETFS = [
 ]
 
 MONEYDJ_URL = "https://www.moneydj.com/ETF/X/Basic/Basic0007B.xdjhtm?etfid={code}.TW"
+TWSE_ACTIVE_LIST_URL = "https://www.twse.com.tw/rwd/zh/ETF/activeList"
 
 HEADERS = {
     "User-Agent": (
@@ -41,6 +44,62 @@ HEADERS = {
     ),
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
+
+
+# =============================================================
+# 證交所 ETF 清單 (canonical universe)
+# =============================================================
+def fetch_active_etf_list(session):
+    """Fetch the active-ETF universe from TWSE activeList.
+
+    Returns a list of {code, name, manager}. This replaces a hardcoded list so
+    new active ETFs are picked up automatically."""
+    r = session.get(
+        TWSE_ACTIVE_LIST_URL,
+        params={"response": "json", "_": int(time.time() * 1000)},
+        headers=HEADERS,
+        timeout=20,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"TWSE activeList status={payload.get('status')}")
+
+    fields = payload.get("fields") or []
+    data = payload.get("data") or []
+
+    def idx(name, fallback):
+        try:
+            return fields.index(name)
+        except ValueError:
+            return fallback
+
+    ci, ni, mi = idx("證券代號", 0), idx("證券簡稱", 1), idx("管理方式", 2)
+    out = []
+    for row in data:
+        try:
+            code = str(row[ci]).strip()
+            name = str(row[ni]).strip()
+            manager = str(row[mi]).strip() if len(row) > mi else ""
+        except (IndexError, TypeError):
+            continue
+        if code and name:
+            out.append({"code": code, "name": name, "manager": manager})
+    return out
+
+
+def write_etf_list_json(out_dir, list_date, etf_list):
+    """Persist the active-ETF universe as a date-stamped JSON snapshot."""
+    payload = {
+        "list_date": list_date,
+        "source": "twse_activelist",
+        "count": len(etf_list),
+        "etfs": etf_list,
+    }
+    (out_dir / f"etf-list-{list_date}.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return payload
 
 
 # =============================================================
@@ -545,15 +604,29 @@ def main():
     else:
         print("前一日快照: 無 (首次執行)")
 
-    print(f"\n[1/3] 抓取 MoneyDJ 持股 ({len(ETFS)} 檔)", flush=True)
     session = requests.Session()
+
+    # ETF universe: live TWSE active list (date-stamped JSON), with the
+    # hardcoded list as a last-resort fallback if TWSE is unreachable.
+    try:
+        etf_list = fetch_active_etf_list(session)
+        etf_codes = [e["code"] for e in etf_list]
+        write_etf_list_json(out_dir, today_date, etf_list)
+        print(f"  [ETF清單] 證交所 activeList: {len(etf_codes)} 檔 -> snapshots/etf-list-{today_date}.json", flush=True)
+    except Exception as e:
+        print(f"  [ETF清單] 證交所抓取失敗 ({e})，改用內建備援清單", flush=True)
+        etf_codes = list(FALLBACK_ETFS)
+    if not etf_codes:
+        etf_codes = list(FALLBACK_ETFS)
+
+    print(f"\n[1/3] 抓取 MoneyDJ 持股 ({len(etf_codes)} 檔)", flush=True)
     all_etf_data = {}
     all_stock_codes = set()
     failed = []
     all_skipped = []
 
-    for i, code in enumerate(ETFS, 1):
-        print(f"  [{i:2d}/{len(ETFS)}] {code}  ", end="", flush=True)
+    for i, code in enumerate(etf_codes, 1):
+        print(f"  [{i:2d}/{len(etf_codes)}] {code}  ", end="", flush=True)
         try:
             data = fetch_etf_holdings(code, session)
             all_etf_data[code] = data
@@ -568,7 +641,7 @@ def main():
         except Exception as e:
             print(f"FAIL  {e}", flush=True)
             failed.append(code)
-        if i < len(ETFS):
+        if i < len(etf_codes):
             time.sleep(2)
 
     # 失敗重試
@@ -743,7 +816,7 @@ def main():
     print(f"執行結果")
     print(f"{'='*60}")
     print(f"  檔名日期:   snapshot-{today_date}.json")
-    print(f"  ETF 成功:   {len(snapshot['today'])}/{len(ETFS)}")
+    print(f"  ETF 成功:   {len(snapshot['today'])}/{len(etf_codes)}")
     if failed:
         print(f"  ETF 失敗:   {', '.join(failed)}")
     print(f"  股票數:     {len(all_stock_codes)}")

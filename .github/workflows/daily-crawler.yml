@@ -2,8 +2,13 @@ name: Daily crawler
 
 on:
   schedule:
-    - cron: "30 7 * * 1-5"
+    # 22:00 Taiwan time (UTC+8) = 14:00 UTC, weekdays. GitHub may delay cron.
+    - cron: "0 14 * * 1-5"
   workflow_dispatch:
+
+# Needed so the job can commit the accumulated JSON snapshots back to the repo.
+permissions:
+  contents: write
 
 jobs:
   crawl:
@@ -13,11 +18,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.txt
-      # Holdings-only: MoneyDJ exposes just the latest snapshot, so the daily
-      # job exists to accumulate it. Quotes are skipped (backfillable by date).
-      - run: python -c "from app.api import AppApi; AppApi(__import__('pathlib').Path('data/market.sqlite')).sync_holdings_snapshot()"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: market-sqlite
-          path: data/market.sqlite
+      - run: pip install requests beautifulsoup4
+      # Fetch the TWSE active-ETF universe (date-stamped JSON) and crawl MoneyDJ
+      # holdings ETF-by-ETF into snapshots/snapshot-YYYY-MM-DD.json + latest.json.
+      # MoneyDJ only exposes the latest snapshot, so daily capture is what builds
+      # the history; previous snapshots are read back for diffing/clearance.
+      - run: python crawlers/fund_holdings.py
+      - name: Commit snapshots
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add snapshots/ latest.json
+          if git diff --staged --quiet; then
+            echo "No new snapshot (likely a non-trading day) — nothing to commit."
+          else
+            git commit -m "snapshot $(date -u +%F)"
+            git push
+          fi
