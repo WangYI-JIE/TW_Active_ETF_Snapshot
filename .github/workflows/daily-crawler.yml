@@ -2,11 +2,18 @@ name: Daily crawler
 
 on:
   schedule:
-    # 06:00 Taiwan (UTC+8) = 22:00 UTC, every day. This is ~1-2h after the US
-    # market close (16:00 ET), so the just-closed US session's prices are
-    # available via yfinance; it also captures the prior TW close. Runs daily —
-    # non-trading days yield no new data, so nothing is committed (implicit
-    # holiday handling). GitHub cron can drift 15-30 min, which is fine here.
+    # Two daily runs (both build/refresh the same-day snapshot; the workflow
+    # commits only if `git diff` shows a change, so non-trading days are no-ops):
+    #
+    #   22:00 Taiwan (14:00 UTC) — TW fund run. TW closed 13:30 and MoneyDJ has
+    #     updated by evening, so TW holdings + closes are fresh. (US has not
+    #     closed yet, so US prices here are the previous US close.)
+    #   06:00 Taiwan (22:00 UTC) — US run, ~1-2h after the US close
+    #     (16:00 ET ≈ 04:00-05:00 TW), refreshing the snapshot's US prices and
+    #     漲跌幅 so they are fresh for the morning.
+    #
+    # GitHub cron can drift 15-30 min, which is fine here.
+    - cron: "0 14 * * *"
     - cron: "0 22 * * *"
   workflow_dispatch:
 

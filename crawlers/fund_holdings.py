@@ -41,31 +41,39 @@ TWSE_ACTIVE_LIST_URL = "https://www.twse.com.tw/rwd/zh/ETF/activeList"
 # 6869.HK (港股), 603256.SH (滬股). We keep the suffix on foreign codes so a
 # foreign numeric ticker (JP/KS/SH) never collides with a TWSE code. Taiwan
 # stays bare numeric (legacy behaviour, unchanged downstream).
-MONEYDJ_FOREIGN_MARKETS = {"US", "JP", "KS", "HK", "SH", "SZ", "SS"}
+#
+# These are the markets we have actually seen. The crawler is NOT limited to
+# them — any dotted uppercase suffix is treated as a foreign market — but an
+# unknown one is logged so a new market surfaces instead of being mis-priced.
+MONEYDJ_KNOWN_MARKETS = {"US", "JP", "KS", "HK", "SH", "SZ", "SS"}
 
-# Map a MoneyDJ market to the suffix yfinance expects. US uses the bare ticker.
-_YF_SUFFIX = {
-    "US": "",
-    "JP": ".T",
-    "KS": ".KS",
-    "HK": ".HK",
-    "SH": ".SS",
-    "SZ": ".SZ",
-    "SS": ".SS",
-}
+# yfinance uses a different suffix from MoneyDJ for a few markets; every other
+# market defaults to ".{MARKET}" (correct for HK/KS/DE/L/PA/SW/AS/TO/SZ...).
+_YF_SUFFIX_OVERRIDE = {"US": "", "JP": ".T", "SH": ".SS", "SS": ".SS"}
+
+
+def yf_suffix(market):
+    """yfinance suffix for a MoneyDJ market. None means 'a Taiwan code'."""
+    if not market or market == "TW":
+        return None
+    return _YF_SUFFIX_OVERRIDE.get(market, f".{market}")
 
 
 def build_holding_code(ticker, market):
     """Stored holding code: bare ticker for Taiwan, ``TICKER.MARKET`` otherwise."""
-    if market == "TW":
+    if not market or market == "TW":
         return ticker
     return f"{ticker}.{market}"
 
 
 def split_market(code):
-    """Inverse of build_holding_code -> (base_ticker, market). Bare = 'TW'."""
-    m = re.match(r"^(.+)\.([A-Z]{2,3})$", code or "")
-    if m and m.group(2) in MONEYDJ_FOREIGN_MARKETS:
+    """(base_ticker, market) for a stored code; bare numeric = 'TW'.
+
+    The market is the LAST dotted segment (1-4 uppercase letters), so a ticker
+    that itself contains a dot is kept whole (``BRK.B.US`` -> ('BRK.B', 'US')).
+    Taiwan codes have no dot, so they never match."""
+    m = re.match(r"^(.+)\.([A-Z]{1,4})$", code or "")
+    if m:
         return m.group(1), m.group(2)
     return code, "TW"
 
@@ -222,18 +230,22 @@ def fetch_etf_holdings(etf_code, session, retries=3):
             continue
 
         # Derive (ticker, market) from the href first (most reliable: it carries
-        # an explicit etfid=TICKER.MARKET), then fall back to the cell text.
-        # Markets seen: .TW 台股, .US 美股, .JP 日股, .KS 韓股, .HK 港股, .SH 滬股.
+        # an explicit etfid=TICKER.MARKET right before &back=), then fall back to
+        # the cell text. The market is the LAST dotted segment (1-4 letters), so
+        # a ticker that contains a dot (e.g. BRK.B.US) is captured whole rather
+        # than truncated. Markets seen: .TW .US .JP .KS .HK .SH.
         ticker = market = None
         link = first_cell.find("a")
         if link and link.get("href"):
-            hm = re.search(r"etfid=([0-9A-Za-z]+)\.([A-Z]{2,3})", link["href"])
+            hm = re.search(r"etfid=([0-9A-Za-z.\-]+?)\.([A-Z]{1,4})(?=&|$)", link["href"])
             if hm:
                 ticker, market = hm.group(1), hm.group(2)
         if ticker is None:
-            cm = re.match(r"(.+?)\(([0-9A-Za-z]+)\.([A-Z]{2,3})\)\s*$", stock_cell_text)
+            cm = re.match(r"(.+?)\(([0-9A-Za-z.\-]+?)\.([A-Z]{1,4})\)\s*$", stock_cell_text)
             if cm:
                 ticker, market = cm.group(2), cm.group(3)
+        if ticker is not None and market not in MONEYDJ_KNOWN_MARKETS and market != "TW":
+            print(f"      ⚠️ 新市場別 {market} (代號 {ticker}) — 已照 .{market} 處理,請確認 yfinance 後綴")
 
         # Bonds/derivatives have no ticker (e.g. 'C 8 1/8 07/15/39') — skip.
         if ticker is None:
@@ -253,7 +265,7 @@ def fetch_etf_holdings(etf_code, session, retries=3):
 
         stock_code = build_holding_code(ticker, market)
         # Cell text is "公司名稱(TICKER.MARKET)"; strip the trailing code if present.
-        stock_name = re.sub(r"\([0-9A-Za-z]+\.[A-Z]{2,3}\)\s*$", "", stock_cell_text)
+        stock_name = re.sub(r"\([0-9A-Za-z.\-]+\.[A-Z]{1,4}\)\s*$", "", stock_cell_text)
         stock_name = stock_name.rstrip("*").strip() or "未知"
 
         try:
@@ -452,7 +464,7 @@ def fetch_prices_bulk_yfinance(codes):
         if market == "TW":
             tw_codes.append(c)
         else:
-            suffix = _YF_SUFFIX.get(market)
+            suffix = yf_suffix(market)
             if suffix is not None:
                 foreign_map[f"{base}{suffix}"] = c
 
@@ -825,8 +837,12 @@ def main():
         update_detail.append("(首次執行, 無上次快照)")
 
     if not has_any_update:
-        print(f"\n{'='*60}\n🛑 台股未開盤日偵測 (無任何 ETF 有新資料)\n{'='*60}\n  -> 本次不寫檔\n{'='*60}\n")
-        return
+        # No NEW TW holdings date vs the prior snapshot. This is normal for the
+        # 06:00 (US-close) run and for TW holidays: we still re-write the
+        # snapshot so refreshed US prices/漲跌幅 land in it. The workflow only
+        # commits if `git diff --staged` shows a change, so a truly idle day
+        # (TW + US both unchanged) produces an identical file and no commit.
+        print(f"\n  ℹ️ 無新的台股 holdings_date — 進入刷新模式 (更新價格/漲跌幅,由 git diff 決定是否 commit)")
 
     print(f"\n  有新資料的 ETF ({len(update_detail)} 檔):")
     for d in update_detail[:5]:
