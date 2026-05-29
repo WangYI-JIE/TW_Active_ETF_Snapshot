@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+data/*.sqlite
+data/*.sqlite-*
+data/exports/
+taiwan-eft-tracker/
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+*.spec

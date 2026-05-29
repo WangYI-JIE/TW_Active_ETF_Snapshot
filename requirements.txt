@@ -1,0 +1,4 @@
+pywebview>=5.0
+tzdata>=2025.2
+requests>=2.32
+beautifulsoup4>=4.12
