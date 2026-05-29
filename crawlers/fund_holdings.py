@@ -36,6 +36,44 @@ FALLBACK_ETFS = [
 MONEYDJ_URL = "https://www.moneydj.com/ETF/X/Basic/Basic0007B.xdjhtm?etfid={code}.TW"
 TWSE_ACTIVE_LIST_URL = "https://www.twse.com.tw/rwd/zh/ETF/activeList"
 
+# MoneyDJ tags every constituent with a market suffix in its href/cell text,
+# e.g. 2330.TW (台股), TSLA.US (美股), 4062.JP (日股), 009150.KS (韓股),
+# 6869.HK (港股), 603256.SH (滬股). We keep the suffix on foreign codes so a
+# foreign numeric ticker (JP/KS/SH) never collides with a TWSE code. Taiwan
+# stays bare numeric (legacy behaviour, unchanged downstream).
+MONEYDJ_FOREIGN_MARKETS = {"US", "JP", "KS", "HK", "SH", "SZ", "SS"}
+
+# Map a MoneyDJ market to the suffix yfinance expects. US uses the bare ticker.
+_YF_SUFFIX = {
+    "US": "",
+    "JP": ".T",
+    "KS": ".KS",
+    "HK": ".HK",
+    "SH": ".SS",
+    "SZ": ".SZ",
+    "SS": ".SS",
+}
+
+
+def build_holding_code(ticker, market):
+    """Stored holding code: bare ticker for Taiwan, ``TICKER.MARKET`` otherwise."""
+    if market == "TW":
+        return ticker
+    return f"{ticker}.{market}"
+
+
+def split_market(code):
+    """Inverse of build_holding_code -> (base_ticker, market). Bare = 'TW'."""
+    m = re.match(r"^(.+)\.([A-Z]{2,3})$", code or "")
+    if m and m.group(2) in MONEYDJ_FOREIGN_MARKETS:
+        return m.group(1), m.group(2)
+    return code, "TW"
+
+
+def is_foreign_code(code):
+    """True for non-Taiwan holdings (priced via yfinance only)."""
+    return split_market(code)[1] != "TW"
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -183,40 +221,22 @@ def fetch_etf_holdings(etf_code, session, retries=3):
         if "個股名稱" in stock_cell_text or not stock_cell_text:
             continue
 
-        m2 = re.match(r"(.+?)\(([0-9A-Z]+)\.TW\)", stock_cell_text)
+        # Derive (ticker, market) from the href first (most reliable: it carries
+        # an explicit etfid=TICKER.MARKET), then fall back to the cell text.
+        # Markets seen: .TW 台股, .US 美股, .JP 日股, .KS 韓股, .HK 港股, .SH 滬股.
+        ticker = market = None
+        link = first_cell.find("a")
+        if link and link.get("href"):
+            hm = re.search(r"etfid=([0-9A-Za-z]+)\.([A-Z]{2,3})", link["href"])
+            if hm:
+                ticker, market = hm.group(1), hm.group(2)
+        if ticker is None:
+            cm = re.match(r"(.+?)\(([0-9A-Za-z]+)\.([A-Z]{2,3})\)\s*$", stock_cell_text)
+            if cm:
+                ticker, market = cm.group(2), cm.group(3)
 
-        if not m2:
-            link = first_cell.find("a")
-            if link and link.get("href"):
-                href = link["href"]
-                href_match = re.search(r"etfid=([0-9A-Z]+)\.TW", href)
-                if href_match:
-                    stock_code = href_match.group(1)
-                    stock_name = stock_cell_text.rstrip("*").strip() or "未知"
-                    m2 = True
-                    try:
-                        weight = float(tds[1].get_text(strip=True))
-                        shares = int(tds[2].get_text(strip=True).replace(",", "").replace(" ", ""))
-                    except (ValueError, AttributeError):
-                        skipped_rows.append({
-                            "raw_text": stock_cell_text,
-                            "weight_raw": tds[1].get_text(strip=True) if len(tds) > 1 else "",
-                            "shares_raw": tds[2].get_text(strip=True) if len(tds) > 2 else "",
-                            "reason": "權重或股數無法解析"
-                        })
-                        continue
-                    lots = shares // 1000
-                    if lots < 1:
-                        continue
-                    holdings.append({
-                        "code": stock_code,
-                        "name": stock_name,
-                        "lots": lots,
-                        "weight": round(weight, 2),
-                    })
-                    continue
-
-        if not m2:
+        # Bonds/derivatives have no ticker (e.g. 'C 8 1/8 07/15/39') — skip.
+        if ticker is None:
             try:
                 weight_raw = tds[1].get_text(strip=True)
                 shares_raw = tds[2].get_text(strip=True)
@@ -231,29 +251,31 @@ def fetch_etf_holdings(etf_code, session, retries=3):
             })
             continue
 
-        if m2 is not True:
-            stock_name = m2.group(1).strip().rstrip("*").strip()
-            stock_code = m2.group(2)
-            try:
-                weight = float(tds[1].get_text(strip=True))
-                shares = int(tds[2].get_text(strip=True).replace(",", "").replace(" ", ""))
-            except (ValueError, AttributeError):
-                skipped_rows.append({
-                    "raw_text": stock_cell_text,
-                    "weight_raw": tds[1].get_text(strip=True),
-                    "shares_raw": tds[2].get_text(strip=True),
-                    "reason": "權重或股數無法解析"
-                })
-                continue
-            lots = shares // 1000
-            if lots < 1:
-                continue
-            holdings.append({
-                "code": stock_code,
-                "name": stock_name,
-                "lots": lots,
-                "weight": round(weight, 2),
+        stock_code = build_holding_code(ticker, market)
+        # Cell text is "公司名稱(TICKER.MARKET)"; strip the trailing code if present.
+        stock_name = re.sub(r"\([0-9A-Za-z]+\.[A-Z]{2,3}\)\s*$", "", stock_cell_text)
+        stock_name = stock_name.rstrip("*").strip() or "未知"
+
+        try:
+            weight = float(tds[1].get_text(strip=True))
+            shares = int(tds[2].get_text(strip=True).replace(",", "").replace(" ", ""))
+        except (ValueError, AttributeError):
+            skipped_rows.append({
+                "raw_text": stock_cell_text,
+                "weight_raw": tds[1].get_text(strip=True) if len(tds) > 1 else "",
+                "shares_raw": tds[2].get_text(strip=True) if len(tds) > 2 else "",
+                "reason": "權重或股數無法解析"
             })
+            continue
+        lots = shares // 1000
+        if lots < 1:
+            continue
+        holdings.append({
+            "code": stock_code,
+            "name": stock_name,
+            "lots": lots,
+            "weight": round(weight, 2),
+        })
 
     return {
         "name": etf_name,
@@ -351,65 +373,109 @@ def recover_skipped_by_name(all_etf_data, name_code_map, all_stock_codes):
 
 
 # =============================================================
-# yfinance (.TW -> .TWO)
+# 代號分類: 台股 (純數字) vs 美股 (含英文字母)
+# =============================================================
+# =============================================================
+# yfinance: 台股 .TW -> .TWO; 海外 (US/JP/KS/HK/SH) 走對應後綴
 # =============================================================
 def fetch_prices_bulk_yfinance(codes):
+    """Return ({code: close}, {code: change_pct}).
+
+    The change_pct ("漲跌幅") is the latest daily change, computed from the last
+    two valid closes in the 5-day window, so the app can show price-change % for
+    many holdings at once without per-stock on-demand calls."""
     prices = {}
+    changes = {}
     try:
         import yfinance as yf
     except ImportError:
         print("  [yfinance] 未安裝, 跳過")
-        return prices
+        return prices, changes
 
-    def _batch(suffix, code_list):
+    def _batch(symbol_to_code):
+        """{yfinance_symbol: stored_code} -> {stored_code: (close, change_pct)}."""
         got = {}
-        if not code_list:
+        if not symbol_to_code:
             return got
-        tickers = [f"{c}{suffix}" for c in code_list]
+        symbols = list(symbol_to_code.keys())
         try:
             df = yf.download(
-                " ".join(tickers),
+                " ".join(symbols),
                 period="5d", interval="1d",
                 progress=False, threads=True, auto_adjust=False,
             )
         except Exception as e:
-            print(f"  [yfinance{suffix}] 批次下載失敗: {e}")
+            print(f"  [yfinance] 批次下載失敗: {e}")
             return got
 
         if df is None or df.empty:
             return got
 
+        def _close_change(series):
+            v = series.dropna()
+            if v.empty:
+                return None
+            close_px = round(float(v.iloc[-1]), 2)
+            chg = None
+            if len(v) >= 2 and float(v.iloc[-2]) != 0:
+                chg = round((float(v.iloc[-1]) - float(v.iloc[-2])) / float(v.iloc[-2]) * 100, 2)
+            return close_px, chg
+
         try:
-            if len(code_list) == 1:
-                if "Close" in df.columns:
-                    v = df["Close"].dropna()
-                    if not v.empty:
-                        got[code_list[0]] = round(float(v.iloc[-1]), 2)
-            else:
-                close = df["Close"]
-                for code in code_list:
-                    t = f"{code}{suffix}"
-                    if t in close.columns:
-                        v = close[t].dropna()
-                        if not v.empty:
-                            got[code] = round(float(v.iloc[-1]), 2)
+            close = df["Close"]
+            if hasattr(close, "columns"):
+                # Multi-symbol (or MultiIndex) frame: one column per symbol.
+                for sym, code in symbol_to_code.items():
+                    if sym in close.columns:
+                        res = _close_change(close[sym])
+                        if res is not None:
+                            got[code] = res
+            elif len(symbols) == 1:
+                # Single symbol with flat columns: Close is a Series.
+                res = _close_change(close)
+                if res is not None:
+                    got[symbol_to_code[symbols[0]]] = res
         except Exception as e:
-            print(f"  [yfinance{suffix}] 解析失敗: {e}")
+            print(f"  [yfinance] 解析失敗: {e}")
         return got
 
-    print(f"  [yfinance.TW ] 嘗試 {len(codes)} 檔...", end="", flush=True)
-    tw_got = _batch(".TW", codes)
-    prices.update(tw_got)
-    print(f" 取得 {len(tw_got)} 檔")
+    def _merge(got):
+        for code, (close_px, chg) in got.items():
+            prices[code] = close_px
+            if chg is not None:
+                changes[code] = chg
 
-    missing = [c for c in codes if c not in prices]
-    if missing:
-        print(f"  [yfinance.TWO] 嘗試 {len(missing)} 檔 (上櫃)...", end="", flush=True)
-        two_got = _batch(".TWO", missing)
-        prices.update(two_got)
-        print(f" 取得 {len(two_got)} 檔")
+    tw_codes = []
+    foreign_map = {}  # yfinance_symbol -> stored_code
+    for c in codes:
+        base, market = split_market(c)
+        if market == "TW":
+            tw_codes.append(c)
+        else:
+            suffix = _YF_SUFFIX.get(market)
+            if suffix is not None:
+                foreign_map[f"{base}{suffix}"] = c
 
-    return prices
+    if tw_codes:
+        print(f"  [yfinance.TW ] 嘗試 {len(tw_codes)} 檔...", end="", flush=True)
+        tw_got = _batch({f"{c}.TW": c for c in tw_codes})
+        _merge(tw_got)
+        print(f" 取得 {len(tw_got)} 檔")
+
+        tw_missing = [c for c in tw_codes if c not in prices]
+        if tw_missing:
+            print(f"  [yfinance.TWO] 嘗試 {len(tw_missing)} 檔 (上櫃)...", end="", flush=True)
+            two_got = _batch({f"{c}.TWO": c for c in tw_missing})
+            _merge(two_got)
+            print(f" 取得 {len(two_got)} 檔")
+
+    if foreign_map:
+        print(f"  [yfinance海外] 嘗試 {len(foreign_map)} 檔 (US/JP/KS/HK/SH)...", end="", flush=True)
+        fx_got = _batch(foreign_map)
+        _merge(fx_got)
+        print(f" 取得 {len(fx_got)} 檔")
+
+    return prices, changes
 
 
 # =============================================================
@@ -534,39 +600,50 @@ def fetch_price_yahoo_html(code, session, headers):
 # 主 orchestrator
 # =============================================================
 def fetch_all_prices(all_stock_codes, session, headers):
+    """Return ({code: close}, {code: change_pct}).
+
+    yfinance is the primary source and supplies change_pct; the TWSE/TPEx/Yahoo
+    fallbacks only fill in a close price (no change_pct) for the few TW codes
+    yfinance misses."""
     codes = sorted(all_stock_codes)
     print(f"\n[價格抓取] 目標 {len(codes)} 檔")
-    prices = fetch_prices_bulk_yfinance(codes)
+    prices, changes = fetch_prices_bulk_yfinance(codes)
     missing = [c for c in codes if c not in prices]
     print(f"  小計: {len(prices)}/{len(codes)}  缺 {len(missing)} 檔")
     if not missing:
-        return prices
-    print(f"\n  [官方 API 批次] 建 cache...")
-    twse_map = fetch_all_twse_prices(session, headers)
-    tpex_map = fetch_all_tpex_prices(session, headers)
-    hit_twse, hit_tpex = 0, 0
-    for c in list(missing):
-        if c in twse_map:
-            prices[c] = twse_map[c]; hit_twse += 1
-        elif c in tpex_map:
-            prices[c] = tpex_map[c]; hit_tpex += 1
-    print(f"  TWSE API 補: {hit_twse} 檔, TPEx API 補: {hit_tpex} 檔")
-    missing = [c for c in codes if c not in prices]
-    print(f"  小計: {len(prices)}/{len(codes)}  缺 {len(missing)} 檔")
-    if not missing:
-        return prices
-    print(f"\n  [Yahoo HTML] 單檔 fallback ({len(missing)} 檔)")
-    for c in missing:
-        p, suffix = fetch_price_yahoo_html(c, session, headers)
-        if p:
-            prices[c] = p
-            print(f"    {c}{suffix} -> {p}")
-        time.sleep(0.3)
+        return prices, changes
+    # 官方 API / Yahoo HTML fallback 僅適用台股 (純數字代號)。
+    # 海外代號 (TICKER.MARKET) 只能靠 yfinance,若 yfinance 拿不到就放棄,
+    # 不要用 .TW/.TWO 後綴去查 (會誤打成台股代號)。
+    tw_missing = [c for c in missing if not is_foreign_code(c)]
+    us_missing = [c for c in missing if is_foreign_code(c)]
+    if tw_missing:
+        print(f"\n  [官方 API 批次] 建 cache...")
+        twse_map = fetch_all_twse_prices(session, headers)
+        tpex_map = fetch_all_tpex_prices(session, headers)
+        hit_twse, hit_tpex = 0, 0
+        for c in list(tw_missing):
+            if c in twse_map:
+                prices[c] = twse_map[c]; hit_twse += 1
+            elif c in tpex_map:
+                prices[c] = tpex_map[c]; hit_tpex += 1
+        print(f"  TWSE API 補: {hit_twse} 檔, TPEx API 補: {hit_tpex} 檔")
+    tw_missing = [c for c in tw_missing if c not in prices]
+    if tw_missing:
+        print(f"\n  [Yahoo HTML] 單檔 fallback ({len(tw_missing)} 檔)")
+        for c in tw_missing:
+            p, suffix = fetch_price_yahoo_html(c, session, headers)
+            if p:
+                prices[c] = p
+                print(f"    {c}{suffix} -> {p}")
+            time.sleep(0.3)
+    if us_missing:
+        print(f"  ⚠️  海外 yfinance 未取得: {', '.join(us_missing)}")
     final_missing = [c for c in codes if c not in prices]
-    print(f"\n  === 最終: {len(prices)}/{len(codes)} ===")
+    print(f"\n  === 最終: {len(prices)}/{len(codes)} (漲跌幅 {len(changes)} 檔) ===")
     if final_missing:
         print(f"  ❌ 仍缺: {', '.join(final_missing)}")
-    return prices
+    return prices, changes
 
 
 # =============================================================
@@ -784,11 +861,12 @@ def main():
             print(f"\n  📦 出清股票補抓: 加入前日有持股、今日已全部出清的 {len(added_for_clearance)} 檔")
             print(f"     (今日持股 {today_only_count} 檔 + 補抓 {len(added_for_clearance)} 檔 = 共 {len(all_stock_codes)} 檔需抓收盤價)")
 
-    # 抓收盤價
-    print(f"\n[2/3] 抓取收盤價", flush=True)
+    # 抓收盤價 + 漲跌幅
+    print(f"\n[2/3] 抓取收盤價 + 漲跌幅", flush=True)
     prices = {}
+    changes = {}
     if all_stock_codes:
-        prices = fetch_all_prices(all_stock_codes, session, HEADERS)
+        prices, changes = fetch_all_prices(all_stock_codes, session, HEADERS)
 
     # 組合快照並儲存
     print(f"\n[3/3] 組合快照並儲存", flush=True)
@@ -796,6 +874,7 @@ def main():
         "today_date": today_date,
         "prev_date": prev_date,
         "prices": prices,
+        "changes": changes,
         "today": {
             code: {
                 "name": data["name"],
