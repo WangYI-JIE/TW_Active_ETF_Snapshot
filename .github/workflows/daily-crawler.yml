@@ -14,8 +14,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: python -c "from app.api import AppApi; AppApi(__import__('pathlib').Path('data/market.sqlite')).sync_today()"
-      - run: python -m crawlers.twse_otc_quotes
+      # Holdings-only: MoneyDJ exposes just the latest snapshot, so the daily
+      # job exists to accumulate it. Quotes are skipped (backfillable by date).
+      - run: python -c "from app.api import AppApi; AppApi(__import__('pathlib').Path('data/market.sqlite')).sync_holdings_snapshot()"
       - uses: actions/upload-artifact@v4
         with:
           name: market-sqlite

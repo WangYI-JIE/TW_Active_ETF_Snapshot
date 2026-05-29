@@ -87,8 +87,17 @@ class AppApi:
     def sync_etf_list(self) -> dict:
         return self.pipeline.sync_etf_list()
 
+    def sync_holdings_snapshot(self) -> dict:
+        """Holdings-only sync for the daily GitHub Action.
+
+        Quotes are intentionally skipped: TWSE/OTC daily quotes can be
+        backfilled by date at any time, whereas MoneyDJ only ever exposes the
+        latest holdings snapshot, so that is the only thing that must be
+        captured daily."""
+        return self.pipeline.sync_today()
+
     def sync_today(self) -> dict:
-        result = self.pipeline.sync_today()
+        result = self.sync_holdings_snapshot()
         # Sync quotes for the latest actual holdings date (MoneyDJ may lag 1-2 days),
         # not for result["date"] (today) which has no stock holdings yet.
         latest_date = self.db.latest_holding_date() or result["date"]
