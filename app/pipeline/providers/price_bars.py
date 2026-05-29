@@ -14,6 +14,14 @@ class AdjPriceProvider:
 
     def __init__(self, adj_price_dir: Path | None = None) -> None:
         self.adj_price_dir = adj_price_dir or Path(__file__).resolve().parents[3] / "adj_price"
+        # The BCD parsers (adj_price/) are imported lazily on first fetch, so
+        # the rest of the app — and the headless daily crawler, which never
+        # fetches K-line data — can run without adj_price/ being present.
+        self.sources: list | None = None
+
+    def _ensure_sources(self) -> None:
+        if self.sources is not None:
+            return
         if str(self.adj_price_dir) not in sys.path:
             sys.path.insert(0, str(self.adj_price_dir))
         from parse_sinopac_bcd import fetch_sinopac_bcd_rows
@@ -25,6 +33,7 @@ class AdjPriceProvider:
         ]
 
     def fetch_price_bars(self, stock_code: str, timeout: float = 20.0) -> tuple[list[dict], str]:
+        self._ensure_sources()
         sources = self.sources[:]
         random.shuffle(sources)
         last_error: Exception | None = None
