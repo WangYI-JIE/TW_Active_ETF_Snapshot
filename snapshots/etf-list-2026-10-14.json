@@ -1,7 +1,7 @@
 {
   "list_date": "2026-10-14",
   "source": "twse_activelist",
-  "count": 34,
+  "count": 35,
   "etfs": [
     {
       "code": "00980A",
@@ -171,6 +171,11 @@
     {
       "code": "00412A",
       "name": "主動安聯亞半導體",
+      "manager": "主動式交易所交易基金"
+    },
+    {
+      "code": "00415A",
+      "name": "主動群益核心50",
       "manager": "主動式交易所交易基金"
     }
   ]
